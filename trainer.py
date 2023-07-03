@@ -34,8 +34,6 @@ import shutil
 from torchvision import datasets, transforms
 from torchvision.transforms import functional as visionF
 
-import enhanced_text_encoder
-
 try:
     pynvml.nvmlInit()
 except pynvml.nvml.NVMLError_LibraryNotFound:
