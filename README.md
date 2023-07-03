@@ -5,3 +5,6 @@ With the following additions: \
 2. FP32 for VAE
 3. noise offset
 4. Designed for booru tags
+
+# Stats
+44GB of VRAM used for batch size of 4 at bucket resolution 896x896
