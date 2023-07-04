@@ -30,6 +30,7 @@ import re
 import traceback
 import gc
 import shutil
+import torch.nn.functional as F
 
 from torchvision import datasets, transforms
 from torchvision.transforms import functional as visionF
