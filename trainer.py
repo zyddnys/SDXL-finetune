@@ -100,6 +100,13 @@ parser.add_argument('--no_migration', type=bool_t, default='False', help='Do not
 parser.add_argument('--skip_validation', type=bool_t, default='False', help='Skip validation of images, useful for speeding up loading of very large datasets that have already been validated.')
 parser.add_argument('--extended_mode_chunks', type=int, default=3, help='Enables extended mode for tokenization with given amount of maximum chunks. Values < 2 disable.')
 parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
+parser.add_argument(
+        "--snr_gamma",
+        type=float,
+        default=5.0,
+        help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
+        "More details here: https://arxiv.org/abs/2303.09556.",
+    )
 
 args = parser.parse_args()
 
@@ -914,6 +921,30 @@ def _get_add_time_ids(unet, text_encoder_2, original_size, crops_coords_top_left
     add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
     return add_time_ids
 
+def compute_snr(noise_scheduler, timesteps):
+    """
+    Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    sqrt_alphas_cumprod = alphas_cumprod**0.5
+    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
+
+    # Expand the tensors.
+    # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026
+    sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
+    alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
+
+    sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[..., None]
+    sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
+
+    # Compute SNR.
+    snr = (alpha / sigma) ** 2
+    return snr
+
 def main(enabled_dis = True):
     """
     TODO:
@@ -1088,7 +1119,7 @@ def main(enabled_dis = True):
         )
 
 
-    noise_scheduler = DDPMScheduler.from_pretrained(
+    noise_scheduler = EulerDiscreteScheduler.from_pretrained(
         args.model,
         subfolder='scheduler',
         use_auth_token=args.hf_token,
@@ -1163,6 +1194,7 @@ def main(enabled_dis = True):
 
     # train!
     gas = args.gradient_accumulation
+    snr_gamma = args.snr_gamma
     load_time_ema = 0
     seconds_per_step_ema = 0
     start_time = time.time()
@@ -1246,7 +1278,23 @@ def main(enabled_dis = True):
                             with torch.autocast('cuda', enabled=args.fp16):
                                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states = encoder_hidden_states, added_cond_kwargs = added_cond_kwargs).sample
                                 
-                            loss = (torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none").mean(dim=[1,2,3])*batch_weights).mean()
+                            if snr_gamma is not None :
+                                # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                                # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                                # This is discussed in Section 4.2 of the same paper.
+                                with torch.no_grad() :
+                                    snr = compute_snr(noise_scheduler, timesteps)
+                                    mse_loss_weights = (
+                                        torch.stack([snr, snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                                    )
+                                # We first calculate the original loss. Then we mean over the non-batch dimensions and
+                                # rebalance the sample-wise losses with their respective loss weights.
+                                # Finally, we take the mean of the rebalanced loss.
+                                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                                loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights * batch_weights
+                                loss = loss.mean()
+                            else :
+                                loss = (torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none").mean(dim=[1,2,3])*batch_weights).mean()
                             noise_pred_b_end = time.perf_counter()
 
                             # backprop and update
@@ -1270,7 +1318,23 @@ def main(enabled_dis = True):
                         if torch.isnan(noise_pred).any() :
                             breakpoint()
                             
-                        loss = (torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none").mean(dim=[1,2,3])*batch_weights).mean()
+                        if snr_gamma is not None :
+                            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                            # This is discussed in Section 4.2 of the same paper.
+                            with torch.no_grad() :
+                                snr = compute_snr(noise_scheduler, timesteps)
+                                mse_loss_weights = (
+                                    torch.stack([snr, snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                                )
+                            # We first calculate the original loss. Then we mean over the non-batch dimensions and
+                            # rebalance the sample-wise losses with their respective loss weights.
+                            # Finally, we take the mean of the rebalanced loss.
+                            loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights * batch_weights
+                            loss = loss.mean()
+                        else :
+                            loss = (torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none").mean(dim=[1,2,3])*batch_weights).mean()
                         noise_pred_b_end = time.perf_counter()
 
                         # backprop and update
