@@ -688,13 +688,6 @@ class AspectDataset(torch.utils.data.Dataset):
         self.tokenizer1 = tokenizer1
         self.tokenizer2 = tokenizer2
 
-        self.transforms = torchvision.transforms.Compose([
-            torchvision.transforms.RandomHorizontalFlip(p=0.5),
-            torchvision.transforms.ToTensor(),
-            torchvision.transforms.Normalize([0.5], [0.5])
-        ])
-        
-
     def process_prompt(self, tags: str) -> Tuple[str, float] :
         tags = tags.split(',')
         tags = [expand_prefix(t) for t in tags]
@@ -709,8 +702,11 @@ class AspectDataset(torch.utils.data.Dataset):
         return_dict = {'pixel_values': None, 'prompt': None, 'weight': None}
 
         image_file = self.store.get_image(item)
+        image_content = np.array(image_file).astype(np.float32) / 255.0
+        image_content = torch.from_numpy(image_content.transpose(2, 0, 1))
+        image_content = 2.0 * image_content - 1.0
 
-        return_dict['pixel_values'] = self.transforms(image_file)
+        return_dict['pixel_values'] = image_content
         prompt, weight = self.process_prompt(self.store.get_caption(item))
         return_dict['weight'] = weight
         if random.random() > self.ucg:
@@ -769,7 +765,7 @@ def encode_prompts_small_clip(device, tokenizer, text_encoder, input_ids) :
         else:
             for i, x in enumerate(input_ids):
                 input_ids[i] = [tokenizer.bos_token_id, *x, *np.full((tokenizer.model_max_length - len(x) - 1), tokenizer.eos_token_id)]
-            outs = text_encoder(torch.asarray(input_ids).to(device), output_hidden_states=True)['hidden_states'][layer_idx]
+            outs = text_encoder(torch.asarray(input_ids).to(device), output_hidden_states=True).hidden_states[layer_idx]
     outs = torch.stack(tuple(outs))
     return outs
 
@@ -784,33 +780,56 @@ def encode_prompts_big_clip(device, tokenizer, text_encoder, input_ids) :
     layer_idx = -2 if args.clip_penultimate else -1
 
     all_pool_outputs = []
+    all_pool_outputs_weights = []
     with torch.autocast('cuda', enabled=args.fp16):
         max_standard_tokens = max_length - 2
         max_chunks = args.extended_mode_chunks
         max_len = np.ceil(max(len(x) for x in input_ids) / max_standard_tokens).astype(int).item() * max_standard_tokens
+        per_sample_len = [len(x) for x in input_ids]
         if max_len > max_standard_tokens:
             for i, x in enumerate(input_ids):
                 if len(x) < max_len:
-                    input_ids[i] = [*x, *np.full((max_len - len(x)), tokenizer.eos_token_id)]
+                    input_ids[i] = [*x, *np.full((max_len - len(x)), 0)]
             batch_t = torch.tensor(input_ids)
             chunks = [batch_t[:, i:i + max_standard_tokens] for i in range(0, max_len, max_standard_tokens)]
             chunk_result = list(range(len(chunks)))
             for i, chunk in enumerate(chunks):
-                chunk = torch.cat((torch.full((chunk.shape[0], 1), tokenizer.bos_token_id), chunk, torch.full((chunk.shape[0], 1), tokenizer.eos_token_id)), 1)
+                sample_weight = []
+                chunk = torch.cat((torch.full((chunk.shape[0], 1), tokenizer.bos_token_id), chunk, torch.full((chunk.shape[0], 1), 0)), 1)
+                for j, sample_len in zip(range(chunk.shape[0]), per_sample_len) :
+                    cur_chunk = i + 1
+                    required_chunk = ((sample_len - 1) // max_standard_tokens) + 1
+                    if cur_chunk == required_chunk :
+                        last_valid_pos = sample_len % max_standard_tokens
+                        if last_valid_pos == 0 and sample_len != 0 :
+                            last_valid_pos = max_standard_tokens
+                        chunk[j, last_valid_pos + 1] = tokenizer.eos_token_id
+                        sample_weight.append(float(last_valid_pos + 2) / float(max_standard_tokens + 2))
+                    elif cur_chunk < required_chunk :
+                        sample_weight.append(1.0)
+                    else :
+                        sample_weight.append(2.0 / (max_standard_tokens + 2.0))
                 out_states = text_encoder(chunk.to(device), output_hidden_states=True)
                 text_embeds = out_states.text_embeds # pooled
                 all_pool_outputs.append(text_embeds)
+                all_pool_outputs_weights.append(torch.asarray(sample_weight).view(-1, 1).to(device).to(text_embeds.dtype))
                 chunk_result[i] = out_states.hidden_states[layer_idx]
             outs = torch.cat(chunk_result, dim=-2)
         else:
+            sample_weight = []
             for i, x in enumerate(input_ids):
-                input_ids[i] = [tokenizer.bos_token_id, *x, *np.full((tokenizer.model_max_length - len(x) - 1), tokenizer.eos_token_id)]
+                input_ids[i] = [tokenizer.bos_token_id, *x, tokenizer.eos_token_id, *np.full((tokenizer.model_max_length - len(x) - 2), 0)]
+                sample_weight.append(1.0)
             out_states = text_encoder(torch.asarray(input_ids).to(device), output_hidden_states=True)
             text_embeds = out_states.text_embeds # pooled
             all_pool_outputs.append(text_embeds)
+            all_pool_outputs_weights.append(torch.asarray(sample_weight).view(-1, 1).to(device).to(text_embeds.dtype))
             outs = out_states.hidden_states[layer_idx]
     outs = torch.stack(tuple(outs))
-    pooled_output = torch.stack(all_pool_outputs, dim = -1).mean(-1) # average of pooled text embd
+    all_pool_outputs = torch.stack(all_pool_outputs, dim = -1)
+    all_pool_outputs_weights = torch.stack(all_pool_outputs_weights, dim = -1)
+    pooled_output = (all_pool_outputs * all_pool_outputs_weights).sum(dim = -1) / all_pool_outputs_weights.sum(dim = -1)
+    #pooled_output = torch.stack(all_pool_outputs, dim = -1).mean(-1)
     return outs, pooled_output
 
 # Adapted from torch-ema https://github.com/fadel/pytorch_ema/blob/master/torch_ema/ema.py#L14
@@ -1185,7 +1204,7 @@ def main(enabled_dis = True):
                 unet=unet if type(unet) is not torch.nn.parallel.DistributedDataParallel else unet.module,
                 tokenizer=tokenizer1,
                 tokenizer_2=tokenizer2,
-                scheduler=EulerDiscreteScheduler.from_pretrained(args.model, subfolder="scheduler", use_auth_token=args.hf_token),
+                scheduler=EulerDiscreteScheduler.from_pretrained(args.model, subfolder="scheduler"),
             )
             print(f'saving checkpoint to: {args.output_path}/{args.run_name}_{global_step}')
             pipeline.save_pretrained(f'{args.output_path}/{args.run_name}_{global_step}')
@@ -1229,7 +1248,7 @@ def main(enabled_dis = True):
                     latents = latents * vae.config.scaling_factor
 
                     # Sample noise
-                    noise = torch.randn_like(latents) + 0.1 * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device = latents.device)
+                    noise = torch.randn_like(latents)
                     bsz = latents.shape[0]
                     # Sample a random timestep for each image
                     timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
@@ -1276,6 +1295,9 @@ def main(enabled_dis = True):
                             # Predict the noise residual and compute loss
                             noise_pred_b_start = time.perf_counter()
                             added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                            #noisy_latents = noise_scheduler.scale_model_input(noisy_latents, timesteps)
+                            sigmas = noise_scheduler.sigmas[timesteps.cpu()]
+                            noisy_latents = noisy_latents / ((sigmas ** 2 + 1) ** 0.5).view(-1, 1, 1, 1).to(noisy_latents.device).to(noisy_latents.dtype)
                             with torch.autocast('cuda', enabled=args.fp16):
                                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states = encoder_hidden_states, added_cond_kwargs = added_cond_kwargs).sample
                                 
@@ -1314,6 +1336,9 @@ def main(enabled_dis = True):
                         # Predict the noise residual and compute loss
                         noise_pred_b_start = time.perf_counter()
                         added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                        #noisy_latents = noise_scheduler.scale_model_input(noisy_latents, timesteps)
+                        sigmas = noise_scheduler.sigmas[timesteps.cpu()]
+                        noisy_latents = noisy_latents / ((sigmas ** 2 + 1) ** 0.5).view(-1, 1, 1, 1).to(noisy_latents.device).to(noisy_latents.dtype)
                         with torch.autocast('cuda', enabled=args.fp16):
                             noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states = encoder_hidden_states, added_cond_kwargs = added_cond_kwargs).sample
                         if torch.isnan(noise_pred).any() :
