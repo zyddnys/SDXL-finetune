@@ -283,7 +283,6 @@ class ImageStore:
             print('include', data_dir)
 
         exts = ['jpg', 'jpeg', 'png', 'bmp', 'webp']
-        exts = ['jpg']
 
         self.image_files = []
         for data_dir in self.data_dirs :
@@ -1139,7 +1138,7 @@ def main(enabled_dis = True):
         )
 
 
-    noise_scheduler = EulerDiscreteScheduler.from_pretrained(
+    noise_scheduler = DDPMScheduler.from_pretrained(
         args.model,
         subfolder='scheduler',
         use_auth_token=args.hf_token,
@@ -1295,9 +1294,6 @@ def main(enabled_dis = True):
                             # Predict the noise residual and compute loss
                             noise_pred_b_start = time.perf_counter()
                             added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                            #noisy_latents = noise_scheduler.scale_model_input(noisy_latents, timesteps)
-                            sigmas = noise_scheduler.sigmas[timesteps.cpu()]
-                            noisy_latents = noisy_latents / ((sigmas ** 2 + 1) ** 0.5).view(-1, 1, 1, 1).to(noisy_latents.device).to(noisy_latents.dtype)
                             with torch.autocast('cuda', enabled=args.fp16):
                                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states = encoder_hidden_states, added_cond_kwargs = added_cond_kwargs).sample
                                 
@@ -1336,9 +1332,6 @@ def main(enabled_dis = True):
                         # Predict the noise residual and compute loss
                         noise_pred_b_start = time.perf_counter()
                         added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                        #noisy_latents = noise_scheduler.scale_model_input(noisy_latents, timesteps)
-                        sigmas = noise_scheduler.sigmas[timesteps.cpu()]
-                        noisy_latents = noisy_latents / ((sigmas ** 2 + 1) ** 0.5).view(-1, 1, 1, 1).to(noisy_latents.device).to(noisy_latents.dtype)
                         with torch.autocast('cuda', enabled=args.fp16):
                             noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states = encoder_hidden_states, added_cond_kwargs = added_cond_kwargs).sample
                         if torch.isnan(noise_pred).any() :
