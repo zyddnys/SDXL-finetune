@@ -1289,85 +1289,43 @@ def main(enabled_dis = True):
                 if not args.train_text_encoder:
                     assert False
                 else:
-                    if enabled_dis :
-                        with unet.join(), text_encoder1.join(), text_encoder2.join():
-                            # Predict the noise residual and compute loss
-                            noise_pred_b_start = time.perf_counter()
-                            added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                            with torch.autocast('cuda', enabled=args.fp16):
-                                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states = encoder_hidden_states, added_cond_kwargs = added_cond_kwargs).sample
-                                
-                            if snr_gamma is not None :
-                                # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                                # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                                # This is discussed in Section 4.2 of the same paper.
-                                with torch.no_grad() :
-                                    snr = compute_snr(noise_scheduler, timesteps)
-                                    mse_loss_weights = (
-                                        torch.stack([snr, snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
-                                    )
-                                # We first calculate the original loss. Then we mean over the non-batch dimensions and
-                                # rebalance the sample-wise losses with their respective loss weights.
-                                # Finally, we take the mean of the rebalanced loss.
-                                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
-                                loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights * batch_weights
-                                loss = loss.mean()
-                            else :
-                                loss = (torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none").mean(dim=[1,2,3])*batch_weights).mean()
-                            noise_pred_b_end = time.perf_counter()
-
-                            # backprop and update
-                            opt_b_start = time.perf_counter()
-                            scaler.scale(loss / gas).backward()
-                            if local_counter > 0 and local_counter % gas == 0 :
-                                torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
-                                torch.nn.utils.clip_grad_norm_(text_encoder1.parameters(), 1.0)
-                                torch.nn.utils.clip_grad_norm_(text_encoder2.parameters(), 1.0)
-                                scaler.step(optimizer)
-                                scaler.update()
-                                optimizer.zero_grad()
-                            lr_scheduler.step()
-                            opt_b_end = time.perf_counter()
+                    # Predict the noise residual and compute loss
+                    noise_pred_b_start = time.perf_counter()
+                    added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                    with torch.autocast('cuda', enabled=args.fp16):
+                        noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states = encoder_hidden_states, added_cond_kwargs = added_cond_kwargs).sample
+                        
+                    if snr_gamma is not None :
+                        # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                        # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                        # This is discussed in Section 4.2 of the same paper.
+                        with torch.no_grad() :
+                            snr = compute_snr(noise_scheduler, timesteps)
+                            mse_loss_weights = (
+                                torch.stack([snr, snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                            )
+                        # We first calculate the original loss. Then we mean over the non-batch dimensions and
+                        # rebalance the sample-wise losses with their respective loss weights.
+                        # Finally, we take the mean of the rebalanced loss.
+                        loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                        loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights * batch_weights
+                        loss = loss.mean()
                     else :
-                        # Predict the noise residual and compute loss
-                        noise_pred_b_start = time.perf_counter()
-                        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                        with torch.autocast('cuda', enabled=args.fp16):
-                            noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states = encoder_hidden_states, added_cond_kwargs = added_cond_kwargs).sample
-                        if torch.isnan(noise_pred).any() :
-                            breakpoint()
-                            
-                        if snr_gamma is not None :
-                            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                            # This is discussed in Section 4.2 of the same paper.
-                            with torch.no_grad() :
-                                snr = compute_snr(noise_scheduler, timesteps)
-                                mse_loss_weights = (
-                                    torch.stack([snr, snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
-                                )
-                            # We first calculate the original loss. Then we mean over the non-batch dimensions and
-                            # rebalance the sample-wise losses with their respective loss weights.
-                            # Finally, we take the mean of the rebalanced loss.
-                            loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
-                            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights * batch_weights
-                            loss = loss.mean()
-                        else :
-                            loss = (torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none").mean(dim=[1,2,3])*batch_weights).mean()
-                        noise_pred_b_end = time.perf_counter()
+                        loss = (torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none").mean(dim=[1,2,3])*batch_weights).mean()
+                    noise_pred_b_end = time.perf_counter()
 
-                        # backprop and update
-                        opt_b_start = time.perf_counter()
-                        scaler.scale(loss / gas).backward()
-                        if local_counter > 0 and local_counter % gas == 0 :
-                            torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
-                            torch.nn.utils.clip_grad_norm_(text_encoder1.parameters(), 1.0)
-                            torch.nn.utils.clip_grad_norm_(text_encoder2.parameters(), 1.0)
-                            scaler.step(optimizer)
-                            scaler.update()
-                            optimizer.zero_grad()
-                        lr_scheduler.step()
-                        opt_b_end = time.perf_counter()
+                    # backprop and update
+                    opt_b_start = time.perf_counter()
+                    scaler.scale(loss / gas).backward()
+                    if local_counter > 0 and local_counter % gas == 0 :
+                        torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
+                        torch.nn.utils.clip_grad_norm_(text_encoder1.parameters(), 1.0)
+                        torch.nn.utils.clip_grad_norm_(text_encoder2.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                    lr_scheduler.step()
+                    opt_b_end = time.perf_counter()
 
                 # Update EMA
                 ema_b_start = time.perf_counter()
