@@ -339,16 +339,19 @@ class ImageStore:
             # cut width
             sheight = bucket_h
             swidth = int(round(w / (h / bucket_h)))
+            crop_left = np.random.randint(0, swidth - bucket_w + 1)
+            crop_top = 0
         else :
             # cut height
             swidth = bucket_w
             sheight = int(round(h / (w / bucket_w)))
+            crop_left = 0
+            crop_top = np.random.randint(0, sheight - bucket_h + 1)
         img2 = img.resize((swidth, sheight), resample = Image.Resampling.BICUBIC)
-        crop_params = transforms.RandomCrop.get_params(img2, (bucket_h, bucket_w))
-        img3 = visionF.crop(img2, *crop_params)
+        img3 = visionF.crop(img2, crop_top, crop_left, bucket_h, bucket_w)
         del img
         del img2
-        return img3
+        return img3, (h, w, crop_top, crop_left, bucket_h, bucket_w)
 
     # gets caption by removing the extension from the filename and replacing it with .txt
     def get_caption(self, ref: Tuple[int, int, int]) -> str:
@@ -700,12 +703,13 @@ class AspectDataset(torch.utils.data.Dataset):
     def __getitem__(self, item: Tuple[int, int, int]):
         return_dict = {'pixel_values': None, 'prompt': None, 'weight': None}
 
-        image_file = self.store.get_image(item)
+        image_file, (h, w, crop_top, crop_left, bucket_h, bucket_w) = self.store.get_image(item)
         image_content = np.array(image_file).astype(np.float32) / 255.0
         image_content = torch.from_numpy(image_content.transpose(2, 0, 1))
         image_content = 2.0 * image_content - 1.0
 
         return_dict['pixel_values'] = image_content
+        return_dict['micro_condition'] = (h, w, crop_top, crop_left, bucket_h, bucket_w)
         prompt, weight = self.process_prompt(self.store.get_caption(item))
         return_dict['weight'] = weight
         if random.random() > self.ucg:
@@ -723,6 +727,7 @@ class AspectDataset(torch.utils.data.Dataset):
         max_length = self.tokenizer1.model_max_length
         max_chunks = args.extended_mode_chunks
 
+        micro_condition = [example['micro_condition'] for example in examples]
         prompts = [example['prompt'] for example in examples]
         input_ids1 = [self.tokenizer1([prompt], truncation=True, return_length=True, return_overflowing_tokens=False, padding=False, add_special_tokens=False, max_length=(max_length * max_chunks) - (max_chunks * 2)).input_ids[0] for prompt in prompts if prompt is not None]
         input_ids2 = [self.tokenizer2([prompt], truncation=True, return_length=True, return_overflowing_tokens=False, padding=False, add_special_tokens=False, max_length=(max_length * max_chunks) - (max_chunks * 2)).input_ids[0] for prompt in prompts if prompt is not None]
@@ -733,7 +738,8 @@ class AspectDataset(torch.utils.data.Dataset):
             'prompts': prompts,
             'input_ids1': input_ids1,
             'input_ids2': input_ids2,
-            'weights': weights
+            'weights': weights,
+            'micro_condition': micro_condition
         }
 
 def encode_prompts_small_clip(device, tokenizer, text_encoder, input_ids) :
@@ -918,19 +924,17 @@ class EMAModel:
             for p in self.shadow_params
         ]
 
-def _get_add_time_ids(unet, text_encoder_2, original_size, crops_coords_top_left, target_size, dtype):
-    add_time_ids = list(original_size + crops_coords_top_left + target_size)
+def _get_add_time_ids(unet, text_encoder_2: CLIPTextModelWithProjection, everything, dtype):
+    add_time_ids = list(everything)
+    if type(text_encoder_2) is torch.nn.parallel.DistributedDataParallel:
+        text_encoder_2 = text_encoder_2.module
+    if type(unet) is torch.nn.parallel.DistributedDataParallel:
+        unet = unet.module
 
-    try :
-        passed_add_embed_dim = (
-            unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_2.config.projection_dim
-        )
-        expected_add_embed_dim = unet.add_embedding.linear_1.in_features
-    except AttributeError :
-        passed_add_embed_dim = (
-            unet.module.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_2.module.config.projection_dim
-        )
-        expected_add_embed_dim = unet.module.add_embedding.linear_1.in_features
+    passed_add_embed_dim = (
+        unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_2.config.projection_dim
+    )
+    expected_add_embed_dim = unet.add_embedding.linear_1.in_features
 
     if expected_add_embed_dim != passed_add_embed_dim:
         raise ValueError(
@@ -1269,13 +1273,10 @@ def main(enabled_dis = True):
                 encoder_hidden_states = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim = 2) # 1x77x(768+1280)
                 text_encode_b_end = time.perf_counter()
 
-                original_size = (1024, 1024)
-                crops_coords_top_left = (0, 0)
-                target_size = (1024, 1024)
-                add_time_ids = _get_add_time_ids(
-                    unet, text_encoder2, original_size, crops_coords_top_left, target_size, dtype=encoder_hidden_states.dtype
-                )
-                add_time_ids = add_time_ids.to(device).repeat(args.batch_size, 1)
+                add_time_ids = [_get_add_time_ids(
+                    unet, text_encoder2, everything, dtype=encoder_hidden_states.dtype
+                ) for everything in batch['micro_condition']]
+                add_time_ids = torch.stack(add_time_ids).to(device)
 
                 noise_scheduler_b_start = time.perf_counter()
                 if noise_scheduler.config.prediction_type == "epsilon":
