@@ -1,3 +1,5 @@
+# DO NOT USE
+The result looks distorted despite my effect to ensure the inputs to the unet are the same as diffusers reference code. I am still investigating the cause. 
 # SDXL-finetune
 Adapted from https://github.com/harubaru/waifu-diffusion/blob/main/trainer/diffusers_trainer.py
 With the following additions:
