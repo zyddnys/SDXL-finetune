@@ -1162,7 +1162,7 @@ def main(enabled_dis = True):
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_sampler=sampler,
-        num_workers=0,
+        num_workers=6,
         collate_fn=dataset.collate_fn
     )
     
@@ -1242,6 +1242,17 @@ def main(enabled_dis = True):
                 end_time = time.time()
                 load_time_ema = 0.9 * load_time_ema + 0.1 * (end_time - start_time)
 
+                do_grad_update = local_counter > 0 and local_counter % gas == 0
+
+                if do_grad_update :
+                    text_encoder1.require_backward_grad_sync = True
+                    text_encoder2.require_backward_grad_sync = True
+                    unet.require_backward_grad_sync = True
+                else :
+                    text_encoder1.require_backward_grad_sync = False
+                    text_encoder2.require_backward_grad_sync = False
+                    unet.require_backward_grad_sync = False
+
                 batch_weights = batch['weights'].to(device, dtype=weight_dtype)
                 
                 b_start = time.perf_counter()
@@ -1318,7 +1329,7 @@ def main(enabled_dis = True):
                     # backprop and update
                     opt_b_start = time.perf_counter()
                     scaler.scale(loss / gas).backward()
-                    if local_counter > 0 and local_counter % gas == 0 :
+                    if do_grad_update :
                         torch.nn.utils.clip_grad_norm_(unet.parameters(), 1.0)
                         torch.nn.utils.clip_grad_norm_(text_encoder1.parameters(), 1.0)
                         torch.nn.utils.clip_grad_norm_(text_encoder2.parameters(), 1.0)
@@ -1331,7 +1342,7 @@ def main(enabled_dis = True):
                 # Update EMA
                 ema_b_start = time.perf_counter()
                 if args.use_ema:
-                    if local_counter > 0 and local_counter % gas == 0 :
+                    if do_grad_update :
                         ema_unet.step(unet.parameters())
                 ema_b_end = time.perf_counter()
 
